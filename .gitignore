@@ -2,3 +2,4 @@
 input/*
 /**/landmark-recognition-2021.zip
 code/model_checkpoints/*
+code/embeddings/*

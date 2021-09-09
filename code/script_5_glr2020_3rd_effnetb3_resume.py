@@ -38,22 +38,24 @@ import timm
 # parameters
 
 MODEL_DIR = './model_checkpoints/'
-# LOAD_MODEL = 'rexnet_200_fold0'
+LOAD_MODEL = 'effnetb3_600_fold1_epoch1'
 DATA_DIR = '../input/'
 LOG_DIR = './logs/'
 DEVICE = 'cuda:0'
-MODEL_NAME = 'rexnet_200_step1'
+MODEL_NAME = 'effnetb3_600'
 
 TRAIN_STEP = 0
-FOLD = 0
+FOLD = 1
 
-IMAGE_SIZE = 512
-BATCH_SIZE = 56
+IMAGE_SIZE = 600
+BATCH_SIZE = 48
 NUM_EPOCHS = 10
 NUM_WORKERS = 4
 LR = 1e-3
 SCHEDULER_PEAK = 0.1
 USE_AMP = True
+
+RESUME_EPOCH = 2
 
 
 # In[3]:
@@ -111,7 +113,7 @@ def get_transforms():
     transforms_train = albumentations.Compose([
         albumentations.Resize(IMAGE_SIZE, IMAGE_SIZE),
         albumentations.HorizontalFlip(p=0.5),
-        albumentations.ImageCompression(quality_lower=99, quality_upper=100),
+        albumentations.ImageCompression(quality_lower=90, quality_upper=100),
         albumentations.ShiftScaleRotate(shift_limit=0.2, scale_limit=0.2, rotate_limit=10, border_mode=0, p=0.7),
         albumentations.Normalize()
     ])
@@ -254,19 +256,19 @@ class GeM(nn.Module):
         return self.__class__.__name__ + '(' + 'p=' + '{:.4f}'.format(self.p.data.tolist()[0]) + ', ' + 'eps=' + str(self.eps) + ')'
 
 
-class RexNet20_Landmark(nn.Module):
+class EffnetB3_Landmark(nn.Module):
 
     def __init__(self, out_dim, load_pretrained=True):
-        super(RexNet20_Landmark, self).__init__()
+        super().__init__()
 
-        self.backbone = timm.create_model('rexnet_200', pretrained=load_pretrained)
+        self.backbone = timm.create_model('tf_efficientnet_b3_ns', pretrained=True)
         self.feat = nn.Sequential(
-            nn.Linear(self.backbone.features[-1].out_channels, 512, bias=True),
+            nn.Linear(self.backbone.num_features, 512, bias=True),
             nn.BatchNorm1d(512),
             Swish_module()
         )
-        self.backbone.head.global_pool = GeM()
-        self.backbone.head.fc = nn.Identity()
+        self.backbone.global_pool = GeM()
+        self.backbone.classifier = nn.Identity()
         
         # self.swish = Swish_module()
         self.metric_classify = ArcMarginProduct_subcenter(512, out_dim)
@@ -278,7 +280,6 @@ class RexNet20_Landmark(nn.Module):
     @autocast()
     def forward(self, x):
         x = self.extract(x)
-        # logits_m = self.metric_classify(self.swish(self.feat(x)))
         logits_m = self.metric_classify(self.feat(x))
         return logits_m
 
@@ -323,15 +324,28 @@ def global_average_precision_score(
         total_score += precision_at_rank_i * relevance_of_prediction_i
 
     return 1 / queries_with_target * total_score
+
+
+def skip_epoch(loader, optimizer, scheduler):
     
+    bar = tqdm(range(len(loader)))
+    
+    for _ in bar:
+        
+        # OneCycleLR stepping
+        scheduler.step()
+        
+        bar.set_description('skipping learning rate: {:.6f};'.format(optimizer.param_groups[0]["lr"]))
+        
 
 def train_epoch(model, loader, optimizer, criterion, scaler, scheduler):
 
     model.train()
     train_loss = []
     bar = tqdm(loader)
+    
     for (data, target) in bar:
-
+            
         data, target = data.cuda(), target.cuda()
         optimizer.zero_grad()
 
@@ -339,12 +353,14 @@ def train_epoch(model, loader, optimizer, criterion, scaler, scheduler):
             logits_m = model(data)
             loss = criterion(logits_m, target)
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.)
             optimizer.step()
         else:
             with autocast():
                 logits_m = model(data)
                 loss = criterion(logits_m, target)
                 scaler.scale(loss).backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.)
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -436,9 +452,14 @@ valid_loader = DataLoader(dataset_valid, batch_size=BATCH_SIZE, num_workers=NUM_
 # In[9]:
 # =============================================================================
 
+# load weight
+load = torch.load(os.path.join(MODEL_DIR, f'{LOAD_MODEL}.pth'))
+model_only_weight = {k[7:] if k.startswith('module.') else k: v for k, v in load['model_state_dict'].items()}
 
 # model
-model = nn.DataParallel(RexNet20_Landmark(out_dim=out_dim)).to(DEVICE)
+model = EffnetB3_Landmark(out_dim=out_dim).cuda()
+model.load_state_dict(model_only_weight)
+model = nn.DataParallel(model)
 
 # loss func
 def criterion(logits_m, target):
@@ -448,6 +469,7 @@ def criterion(logits_m, target):
 
 # optimizer
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+optimizer.load_state_dict(load['optimizer_state_dict'])
 scaler = GradScaler(enabled=True)
 
 # scheduler
@@ -466,26 +488,32 @@ for epoch in range(NUM_EPOCHS):
     curr_time = datetime.strftime(datetime.now(), '%Y%b%d_%HH%MM%SS')
     print(curr_time, 'Epoch:', epoch)
     
-    train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler, scheduler)
-    val_loss, acc_m, gap_m = val_epoch(model, valid_loader, criterion)
+    if epoch < RESUME_EPOCH:
+        
+        skip_epoch(train_loader, optimizer, scheduler)
+        
+    else:
+        
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler, scheduler)
+        val_loss, acc_m, gap_m = val_epoch(model, valid_loader, criterion)
 
-    content = curr_time + ' ' + f'Fold {FOLD}, Epoch {epoch}, lr: {optimizer.param_groups[0]["lr"]:.7f}, train loss: {np.mean(train_loss):.5f}, valid loss: {(val_loss):.5f}, acc_m: {(acc_m):.6f}, gap_m: {(gap_m):.6f}.'
-    print(content)
-    
-    with open(os.path.join(MODEL_DIR, f'{MODEL_NAME}.txt'), 'a') as appender:
-        appender.write(content + '\n')
+        content = curr_time + ' ' + f'Fold {FOLD}, Epoch {epoch}, lr: {optimizer.param_groups[0]["lr"]:.7f}, train loss: {np.mean(train_loss):.5f}, valid loss: {(val_loss):.5f}, acc_m: {(acc_m):.6f}, gap_m: {(gap_m):.6f}.'
+        print(content)
 
-    print('gap_m_max ({:.6f} --> {:.6f}). Saving model ...'.format(gap_m_max, gap_m))
-    
-    model_file = os.path.join(MODEL_DIR, f'{MODEL_NAME}_fold{FOLD}_epoch{epoch}.pth')
-    torch.save(
-        {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        },
-        model_file
-    )
-    gap_m_max = gap_m
+        with open(os.path.join(MODEL_DIR, f'{MODEL_NAME}.txt'), 'a') as appender:
+            appender.write(content + '\n')
+
+        print('gap_m_max ({:.6f} --> {:.6f}). Saving model ...'.format(gap_m_max, gap_m))
+
+        model_file = os.path.join(MODEL_DIR, f'{MODEL_NAME}_fold{FOLD}_epoch{epoch}.pth')
+        torch.save(
+            {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            },
+            model_file
+        )
+        gap_m_max = gap_m
 
 print(datetime.strftime(datetime.now(), '%Y%b%d_%HH%MM%SS'), 'Training Finished!')

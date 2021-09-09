@@ -6,6 +6,7 @@
 
 
 import os
+import random
 from datetime import datetime
 from typing import Dict, Tuple, Any
 from tqdm import tqdm
@@ -38,21 +39,21 @@ import timm
 # parameters
 
 MODEL_DIR = './model_checkpoints/'
-LOAD_MODEL = 'rexnet_200_fold0_final'
+LOAD_MODEL = 'rexnet_200_step1_fold0_epoch6'
 DATA_DIR = '../input/'
 LOG_DIR = './logs/'
 DEVICE = 'cuda:0'
-MODEL_NAME = 'rexnet_200_step1'
+MODEL_NAME = 'rexnet_200_step2'
 
 TRAIN_STEP = 1
 FOLD = 0
 
-IMAGE_SIZE = 512
-BATCH_SIZE = 48
+IMAGE_SIZE = 768
+BATCH_SIZE = 30
 NUM_EPOCHS = 40
 NUM_WORKERS = 4
 LR = 1e-3
-SCHEDULER_PEAK = 0.02
+SCHEDULER_PEAK = 0.05
 USE_AMP = True
 
 
@@ -71,6 +72,7 @@ def set_seed(seed=0):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
 
+set_seed()
 
 # In[4]:
 # =============================================================================
@@ -108,13 +110,12 @@ class LandmarkDataset(Dataset):
 
 
 def get_transforms():
-
+    # albumentations.Cutout(max_h_size=int(IMAGE_SIZE * 0.4), max_w_size=int(IMAGE_SIZE * 0.4), num_holes=1, p=0.5),
     transforms_train = albumentations.Compose([
         albumentations.Resize(IMAGE_SIZE, IMAGE_SIZE),
         albumentations.HorizontalFlip(p=0.5),
         albumentations.ImageCompression(quality_lower=99, quality_upper=100),
         albumentations.ShiftScaleRotate(shift_limit=0.2, scale_limit=0.2, rotate_limit=10, border_mode=0, p=0.7),
-        albumentations.Cutout(max_h_size=int(IMAGE_SIZE * 0.4), max_w_size=int(IMAGE_SIZE * 0.4), num_holes=1, p=0.5),
         albumentations.Normalize()
     ])
 
@@ -237,17 +238,24 @@ class ArcFaceLossAdaptiveMargin(nn.modules.Module):
         return loss
 
 
+def gem(x, p=3, eps=1e-6):
+    return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1./p)
+
 
 class GeM(nn.Module):
-    def __init__(self, p=3, eps=1e-6):
-        
-        super().__init__()
-        
-        self.p=p
-        self.eps=eps
-        
+    def __init__(self, p=3, eps=1e-6, p_trainable=True):
+        super(GeM,self).__init__()
+        if p_trainable:
+            self.p = Parameter(torch.ones(1)*p)
+        else:
+            self.p = p
+        self.eps = eps
+
     def forward(self, x):
-        return F.avg_pool2d(x.clamp(min=self.eps).pow(self.p), (x.size(-2), x.size(-1))).pow(1./self.p)
+        return gem(x, p=self.p, eps=self.eps)
+    
+    def __repr__(self):
+        return self.__class__.__name__ + '(' + 'p=' + '{:.4f}'.format(self.p.data.tolist()[0]) + ', ' + 'eps=' + str(self.eps) + ')'
 
 
 class RexNet20_Landmark(nn.Module):
@@ -255,20 +263,27 @@ class RexNet20_Landmark(nn.Module):
     def __init__(self, out_dim, load_pretrained=True):
         super(RexNet20_Landmark, self).__init__()
 
-        self.net = timm.create_model('rexnet_200', pretrained=load_pretrained)
-        self.feat = nn.Linear(self.net.features[-1].out_channels, 512)
-        self.swish = Swish_module()
+        self.backbone = timm.create_model('rexnet_200', pretrained=load_pretrained)
+        self.feat = nn.Sequential(
+            nn.Linear(self.backbone.features[-1].out_channels, 512, bias=True),
+            nn.BatchNorm1d(512),
+            Swish_module()
+        )
+        self.backbone.head.global_pool = GeM()
+        self.backbone.head.fc = nn.Identity()
+        
+        # self.swish = Swish_module()
         self.metric_classify = ArcMarginProduct_subcenter(512, out_dim)
-        self.net.head.global_pool = GeM()
-        self.net.head.fc = nn.Identity()
+
 
     def extract(self, x):
-        return self.net(x).squeeze()
+        return self.backbone(x)[:, :, 0, 0]
 
     @autocast()
     def forward(self, x):
         x = self.extract(x)
-        logits_m = self.metric_classify(self.swish(self.feat(x)))
+        # logits_m = self.metric_classify(self.swish(self.feat(x)))
+        logits_m = self.metric_classify(self.feat(x))
         return logits_m
 
 
@@ -397,6 +412,7 @@ def val_epoch(model, valid_loader, criterion, get_output=False):
 
 # get dataframe
 df, out_dim = get_df()
+# out_dim = 81313
 print(f"out_dim = {out_dim}")
 
 # get adaptive margin
@@ -428,13 +444,14 @@ valid_loader = DataLoader(dataset_valid, batch_size=BATCH_SIZE, num_workers=NUM_
 # load weight
 load = torch.load(os.path.join(MODEL_DIR, f'{LOAD_MODEL}.pth'))
 # remove metric module weight
-model_only_weight = {
-    k[7:] if k.startswith('module.') else k: v for k, v in load['model_state_dict'].items() if 'metric_classify' not in k
-}
+# model_only_weight = {
+#     k[7:] if k.startswith('module.') else k: v for k, v in load['model_state_dict'].items() if 'metric_classify' not in k
+# }
+model_only_weight = {k[7:] if k.startswith('module.') else k: v for k, v in load['model_state_dict'].items()}
 
 # model
 model = RexNet20_Landmark(out_dim=out_dim).cuda()
-model.load_state_dict(model_only_weight, strict=False)
+model.load_state_dict(model_only_weight)
 
 model = nn.DataParallel(model)
 
@@ -458,7 +475,6 @@ scheduler = OneCycleLR(optimizer, max_lr=LR, steps_per_epoch=len(train_loader), 
 
 # train & valid loop
 gap_m_max = 0.
-model_file = os.path.join(MODEL_DIR, f'{MODEL_NAME}_fold{FOLD}.pth')
 
 for epoch in range(NUM_EPOCHS):
     
@@ -476,6 +492,7 @@ for epoch in range(NUM_EPOCHS):
 
     print('gap_m_max ({:.6f} --> {:.6f}). Saving model ...'.format(gap_m_max, gap_m))
     
+    model_file = os.path.join(MODEL_DIR, f'{MODEL_NAME}_fold{FOLD}_epoch{epoch}.pth')
     torch.save(
         {
             'epoch': epoch,
@@ -487,13 +504,4 @@ for epoch in range(NUM_EPOCHS):
     gap_m_max = gap_m
 
 print(datetime.strftime(datetime.now(), '%Y%b%d_%HH%MM%SS'), 'Training Finished!')
-
-torch.save(
-    {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-    }, 
-    os.path.join(MODEL_DIR, f'{MODEL_NAME}_fold{FOLD}_final.pth')
-)
 

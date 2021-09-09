@@ -38,17 +38,16 @@ import timm
 # parameters
 
 MODEL_DIR = './model_checkpoints/'
-# LOAD_MODEL = 'rexnet_200_fold0'
 DATA_DIR = '../input/'
 LOG_DIR = './logs/'
 DEVICE = 'cuda:0'
-MODEL_NAME = 'rexnet_200_step1'
+MODEL_NAME = 'effnetb3_600'
 
 TRAIN_STEP = 0
-FOLD = 0
+FOLD = 1
 
-IMAGE_SIZE = 512
-BATCH_SIZE = 56
+IMAGE_SIZE = 600
+BATCH_SIZE = 48
 NUM_EPOCHS = 10
 NUM_WORKERS = 4
 LR = 1e-3
@@ -111,7 +110,7 @@ def get_transforms():
     transforms_train = albumentations.Compose([
         albumentations.Resize(IMAGE_SIZE, IMAGE_SIZE),
         albumentations.HorizontalFlip(p=0.5),
-        albumentations.ImageCompression(quality_lower=99, quality_upper=100),
+        albumentations.ImageCompression(quality_lower=90, quality_upper=100),
         albumentations.ShiftScaleRotate(shift_limit=0.2, scale_limit=0.2, rotate_limit=10, border_mode=0, p=0.7),
         albumentations.Normalize()
     ])
@@ -254,19 +253,19 @@ class GeM(nn.Module):
         return self.__class__.__name__ + '(' + 'p=' + '{:.4f}'.format(self.p.data.tolist()[0]) + ', ' + 'eps=' + str(self.eps) + ')'
 
 
-class RexNet20_Landmark(nn.Module):
+class EffnetB3_Landmark(nn.Module):
 
     def __init__(self, out_dim, load_pretrained=True):
-        super(RexNet20_Landmark, self).__init__()
+        super().__init__()
 
-        self.backbone = timm.create_model('rexnet_200', pretrained=load_pretrained)
+        self.backbone = timm.create_model('tf_efficientnet_b3_ns', pretrained=True)
         self.feat = nn.Sequential(
-            nn.Linear(self.backbone.features[-1].out_channels, 512, bias=True),
+            nn.Linear(self.backbone.num_features, 512, bias=True),
             nn.BatchNorm1d(512),
             Swish_module()
         )
-        self.backbone.head.global_pool = GeM()
-        self.backbone.head.fc = nn.Identity()
+        self.backbone.global_pool = GeM()
+        self.backbone.classifier = nn.Identity()
         
         # self.swish = Swish_module()
         self.metric_classify = ArcMarginProduct_subcenter(512, out_dim)
@@ -278,7 +277,6 @@ class RexNet20_Landmark(nn.Module):
     @autocast()
     def forward(self, x):
         x = self.extract(x)
-        # logits_m = self.metric_classify(self.swish(self.feat(x)))
         logits_m = self.metric_classify(self.feat(x))
         return logits_m
 
@@ -438,7 +436,7 @@ valid_loader = DataLoader(dataset_valid, batch_size=BATCH_SIZE, num_workers=NUM_
 
 
 # model
-model = nn.DataParallel(RexNet20_Landmark(out_dim=out_dim)).to(DEVICE)
+model = nn.DataParallel(EffnetB3_Landmark(out_dim=out_dim)).cuda()
 
 # loss func
 def criterion(logits_m, target):
