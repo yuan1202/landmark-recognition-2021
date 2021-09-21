@@ -39,7 +39,7 @@ DATA_DIR = '../input/'
 LOAD_MODEL = 'effnetv2m_in21k_fold2_epoch8'
 
 IMAGE_SIZE = 600
-BATCH_SIZE = 38
+BATCH_SIZE = 48
 NUM_WORKERS = 4
 USE_AMP = True
 
@@ -198,17 +198,11 @@ model = model.eval()
 
 
 # get dataframe
-df = pd.read_csv('../input/train_0.csv')
-landmark_set = set(df['landmark_id'].unique())
-df_full = pd.read_csv('../input/train_full.csv')
-df_full['filtered_landmark'] = df_full['landmark_id'].apply(lambda x: x in landmark_set)
-df_full = df_full.loc[df_full['filtered_landmark'] == True].copy()
-# np.save('./embeddings/trainfullfiltered_embeddings_targets', df_full['landmark_id'].values)
-print(df_full.shape)
-df_full['filepath'] = df_full['id'].apply(lambda x: os.path.join(DATA_DIR, 'gldv2_full', x[0], x[1], x[2], f'{x}.jpg'))
+df = pd.read_csv('../input/recognition_solution_v2.1.csv')
+df = df.loc[df['landmarks'].isna()]
+df['filepath'] = df['id'].apply(lambda x: os.path.join(DATA_DIR, 'test_2019', x[0], x[1], x[2], f'{x}.jpg'))
 
-
-dataset = LandmarkDataset(df_full, transform=transforms)
+dataset = LandmarkDataset(df, transform=transforms)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False, pin_memory=True)
 
 
@@ -217,7 +211,7 @@ dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,
 
 with torch.no_grad():
     
-    embeddings = np.zeros((len(df_full) , 512), dtype=np.float16)
+    embeddings = np.zeros((len(df) , 512), dtype=np.float16)
     
     for idx, data in tqdm(enumerate(dataloader), total=len(dataloader)):
         
@@ -234,5 +228,5 @@ with torch.no_grad():
 
 
 
-np.save("./embeddings/{}_embeddings".format(LOAD_MODEL), embeddings)
+np.save("./embeddings/{}_test2019nonlandmark_embeddings".format(LOAD_MODEL), embeddings)
 

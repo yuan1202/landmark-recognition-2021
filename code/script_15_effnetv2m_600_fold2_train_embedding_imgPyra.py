@@ -18,6 +18,10 @@ import numpy as np # linear algebra
 import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
 
 import cv2
+# https://github.com/albumentations-team/albumentations#documentation
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
 import albumentations
 from torch.utils.data import Dataset
 
@@ -38,8 +42,14 @@ import timm
 DATA_DIR = '../input/'
 LOAD_MODEL = 'effnetv2m_in21k_fold2_epoch8'
 
-IMAGE_SIZE = 600
-BATCH_SIZE = 38
+# 1/sqrt(2)
+IMAGE_SIZE0 = int(np.round(600 * 0.70710677).item())
+# 1
+IMAGE_SIZE1 = 600
+# sqrt(2)
+IMAGE_SIZE2 = int(np.round(600 * 1.4142135).item())
+
+BATCH_SIZE = 48
 NUM_WORKERS = 4
 USE_AMP = True
 
@@ -73,8 +83,18 @@ class LandmarkDataset(Dataset):
         return torch.tensor(image)
 
 
-transforms = albumentations.Compose([
-    albumentations.Resize(IMAGE_SIZE, IMAGE_SIZE),
+transforms0 = albumentations.Compose([
+    albumentations.Resize(IMAGE_SIZE0, IMAGE_SIZE0),
+    albumentations.Normalize()
+])
+
+transforms1 = albumentations.Compose([
+    albumentations.Resize(IMAGE_SIZE1, IMAGE_SIZE1),
+    albumentations.Normalize()
+])
+
+transforms2 = albumentations.Compose([
+    albumentations.Resize(IMAGE_SIZE2, IMAGE_SIZE2),
     albumentations.Normalize()
 ])
 
@@ -190,7 +210,6 @@ model_only_weight = {k[7:] if k.startswith('module.') else k: v for k, v in load
 model = EffnetV2m_Landmark(out_dim=out_dim).cuda()
 model.load_state_dict(model_only_weight)
 model = nn.DataParallel(model)
-
 model = model.eval()
 
 
@@ -203,36 +222,64 @@ landmark_set = set(df['landmark_id'].unique())
 df_full = pd.read_csv('../input/train_full.csv')
 df_full['filtered_landmark'] = df_full['landmark_id'].apply(lambda x: x in landmark_set)
 df_full = df_full.loc[df_full['filtered_landmark'] == True].copy()
-# np.save('./embeddings/trainfullfiltered_embeddings_targets', df_full['landmark_id'].values)
 print(df_full.shape)
 df_full['filepath'] = df_full['id'].apply(lambda x: os.path.join(DATA_DIR, 'gldv2_full', x[0], x[1], x[2], f'{x}.jpg'))
 
 
-dataset = LandmarkDataset(df_full, transform=transforms)
+# In[ ]:
+                
+      
+# -----------------------
+embeddings = torch.zeros((len(df_full) , 512), dtype=torch.float16, device='cpu')
+
+dataset = LandmarkDataset(df_full, transform=transforms0)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False, pin_memory=True)
-
-
-# In[ ]:
-
-
+                
 with torch.no_grad():
-    
-    embeddings = np.zeros((len(df_full) , 512), dtype=np.float16)
-    
-    for idx, data in tqdm(enumerate(dataloader), total=len(dataloader)):
+    for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
         
-        data = data.cuda()
-
+        batch = batch.cuda()
+        
         with autocast():
-            embedding = F.normalize(model(data))
+            embedding = model(batch)
         
-        embeddings[idx*BATCH_SIZE:idx*BATCH_SIZE+embedding.size(0), :] = embedding.detach().cpu().numpy()
+        embeddings[idx*BATCH_SIZE:idx*BATCH_SIZE+embedding.size(0), :] = embedding.detach().cpu()
+        
+np.save("./embeddings/{}_embeddings_3scales_low".format(LOAD_MODEL), embeddings.numpy())
+        
+# -----------------------
+embeddings = torch.zeros((len(df_full) , 512), dtype=torch.float16, device='cpu')
 
+dataset = LandmarkDataset(df_full, transform=transforms1)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False, pin_memory=True)
+                
+with torch.no_grad():
+    for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+        
+        batch = batch.cuda()
+        
+        with autocast():
+            embedding = model(batch)
+        
+        embeddings[idx*BATCH_SIZE:idx*BATCH_SIZE+embedding.size(0), :] = embedding.detach().cpu()
+        
+np.save("./embeddings/{}_embeddings_3scales_mid".format(LOAD_MODEL), embeddings.numpy())
+        
+# -----------------------
+embeddings = torch.zeros((len(df_full) , 512), dtype=torch.float16, device='cpu')
 
+dataset = LandmarkDataset(df_full, transform=transforms2)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=False, pin_memory=True)
+                
+with torch.no_grad():
+    for idx, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+        
+        batch = batch.cuda()
+        
+        with autocast():
+            embedding = model(batch)
+        
+        embeddings[idx*BATCH_SIZE:idx*BATCH_SIZE+embedding.size(0), :] = embedding.detach().cpu()
 
-# In[ ]:
-
-
-
-np.save("./embeddings/{}_embeddings".format(LOAD_MODEL), embeddings)
+np.save("./embeddings/{}_embeddings_3scales_high".format(LOAD_MODEL), embeddings.numpy())
 
