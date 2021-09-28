@@ -4,3 +4,5 @@ input/*
 code/model_checkpoints/*
 code/embeddings/*
 ext/*
+extLM/*
+*.npy
